@@ -1,0 +1,12 @@
+{
+    "version": 0,
+    "name": "install",
+
+    "tools": {
+        "anaconda": {
+            "label": "Installation"
+        }
+    },
+
+    "content-security-policy": "default-src 'self' 'unsafe-inline' 'unsafe-eval'"
+}

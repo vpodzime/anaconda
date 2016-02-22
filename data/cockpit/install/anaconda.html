@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title translatable="yes">Terminal</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="../base1/cockpit.css" type="text/css" rel="stylesheet">
+    <script src="../base1/bundle.js"></script>
+    <script src="../system/bundle.js"></script>
+    <script src="../base1/jquery.js"></script>
+    <script src="../base1/cockpit.js"></script>
+</head>
+<body>
+  <table class="cockpit-form-table" style="width: 0;">
+    <tr>
+      <td><label class="control-label" for="url">Kickstart URL</label></td>
+      <td><input class="form-control" type="url" id="url" autofocus="true" style="width: 400px"></td>
+      <td><button class="btn btn-default btn-primary pull-left" id="install">Install</button></td>
+      <td><span id="result"></span></td>
+    </tr>
+  </table>
+
+  <div class="panel panel-default console-container">
+    <div id="terminal" class="console" hidden>
+    </div>
+  </div>
+
+<script>
+   var term = null;
+   var channel = null;
+
+   /* helper functions */
+   function start_terminal() {
+       require(["base1/term"], function (Terminal) {
+           term = new Terminal({
+               cols: 80,
+               rows: 24,
+               screenKeys: true
+           });
+
+           /* term.js wants the parent element to build its terminal inside of */
+           var container = $('#terminal');
+           term.open(container[0]);
+           container.children().first().css('margin', 0);
+
+           channel = cockpit.channel({
+               "payload": "stream",
+               "spawn": ["anaconda", "--text", "--ks"],
+               "environ": [
+                   "TERM=xterm-256color",
+                   "PATH=/sbin:/bin:/usr/sbin:/usr/bin"
+               ],
+               "pty": true
+           });
+
+           $(channel).on("close", function(ev, options) {
+                   if (term) {
+                       var problem = options.problem || "disconnected";
+                       term.write('\x1b[31m' + problem + '\x1b[m\r\n');
+                       /* There's no term.hideCursor() function */
+                       term.cursorHidden = true;
+                       term.refresh(term.y, term.y);
+                       $("#install").attr("disabled", false);
+                   }
+           });
+
+           $(channel).on("message", function(ev, payload) {
+               /* Output from pty to terminal */
+               if (term)
+                   term.write(payload);
+           });
+
+           term.on('data', function(data) {
+               /* Output from terminal to pty */
+               if (channel && channel.valid)
+                   channel.send(data);
+           });
+
+           term.on('title', function(title) {
+               $("#terminal-title").text(title);
+           });
+       });
+   };
+
+   function run_anaconda() {
+       start_terminal();
+   }
+
+   /* Event callbacks */
+   $("#install").on('click', function() {
+       // make sure we are only running the correct process once
+       $("#install").attr("disabled", true);
+
+        var url = $("#url");
+        if (url.val() == "") {
+            $("#result").css("color", "blue");
+            $("#result").text("No URL given");
+            $("#url").focus();
+            $("#install").attr("disabled", false);
+            return;
+        }
+        console.log("Running wget", url.val());
+        $("#result").text("");
+        var proc = cockpit.spawn(["wget", "-O", "/run/install/ks.cfg", url.val()], {"err": "out"});
+        proc.done(wget_success);
+        proc.stream(wget_output);
+        proc.fail(wget_fail);
+    });
+    $("#url").on('input', function() {
+        $("#result").text("");
+    });
+
+    function wget_output(data) {
+        console.log(data);
+    };
+
+    function wget_success() {
+        console.log("Running anaconda");
+        run_anaconda();
+        $("#terminal").show();
+    };
+
+    function wget_fail() {
+        $("#result").css("color", "red");
+        $("#result").text("Failed to fetch. Wrong URL?");
+        $("#url").focus();
+        $("#url").select();
+        $("#install").attr("disabled", false);
+    };
+</script>
+</body>
+</html>
