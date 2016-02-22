@@ -314,6 +314,7 @@ def copyUpdatedFiles(tag, updates, cwd, builddir):
             if not os.path.isdir(os.path.join(updates, "usr/sbin")):
                 os.makedirs(os.path.join(updates, "usr/sbin"))
             shutil.copy2(gitfile, os.path.join(updates, "usr/sbin/anaconda"))
+            sys.stdout.write("Including usr/sbin/anaconda\n")
         elif gitfile.endswith('.service') or gitfile.endswith(".target"):
             # same for systemd services
             install_to_dir(gitfile, "usr/lib/systemd/system")
