@@ -73,7 +73,7 @@ from pykickstart.constants import CLEARPART_TYPE_NONE, CLEARPART_TYPE_ALL, \
                                   KS_SCRIPT_POST, KS_SCRIPT_PRE, KS_SCRIPT_TRACEBACK, KS_SCRIPT_PREINSTALL, \
                                   SELINUX_DISABLED, SELINUX_ENFORCING, SELINUX_PERMISSIVE, \
                                   SNAPSHOT_WHEN_POST_INSTALL, SNAPSHOT_WHEN_PRE_INSTALL
-from pykickstart.errors import formatErrorMsg, KickstartError, KickstartParseError
+from pykickstart.errors import formatErrorMsg, KickstartError, KickstartParseError, KickstartValueError
 from pykickstart.parser import KickstartParser
 from pykickstart.parser import Script as KSScript
 from pykickstart.sections import NullSection, PackageSection, PostScriptSection, PreScriptSection, PreInstallScriptSection, \
@@ -1152,6 +1152,43 @@ class Logging(commands.logging.FC6_Logging):
                 remote_server = "%s:%s" % (self.host, self.port)
             anaconda_logging.logger.updateRemote(remote_server)
 
+
+class Mount(commands.mount.F27_Mount):
+    def execute(self, storage, ksdata, instClass):
+        storage.do_autopart = False
+
+        for md in self.dataList():
+            md.execute(storage, ksdata, instClass)
+
+class MountData(commands.mount.F27_MountData):
+    def execute(self, storage, ksdata, instClass):
+        dev = storage.devicetree.resolve_device(self.device)
+        if dev is None:
+            raise KickstartValueError(formatErrorMsg(self.lineno,
+                                      msg=_("Unknown or invalid device '%s' specified" % self.device)))
+        if self.reformat:
+            if self.format:
+                fmt = get_format(self.format)
+                if not fmt:
+                    msg = _("Unknown or invalid format '%s' specified for device '%s'" % \
+                            (self.format, self.device))
+                    raise KickstartValueError(formatErrorMsg(self.lineno, msg))
+            else:
+                old_fmt = dev.format
+                if not old_fmt or old_fmt.type is None:
+                    raise KickstartValueError(formatErrorMsg(self.lineno,
+                                              msg=_("No format on device '%s'" % self.device)))
+                fmt = get_format(old_fmt.type)
+            storage.format_device(dev, fmt)
+
+        # only set mount points for mountable formats
+        if dev.format.mountable:
+            dev.format.mountpoint = self.mount_point
+
+        # make sure swaps end up in /etc/fstab
+        if fmt.type == "swap":
+            storage.add_fstab_swap(dev)
+
 class Network(commands.network.F27_Network):
     def __init__(self, *args, **kwargs):
         commands.network.F27_Network.__init__(self, *args, **kwargs)
@@ -2194,6 +2231,7 @@ commandMap = {
     "lang": Lang,
     "logging": Logging,
     "logvol": LogVol,
+    "mount": Mount,
     "network": Network,
     "part": Partition,
     "partition": Partition,
@@ -2217,6 +2255,7 @@ commandMap = {
 dataMap = {
     "BTRFSData": BTRFSData,
     "LogVolData": LogVolData,
+    "MountData": MountData,
     "PartData": PartitionData,
     "RaidData": RaidData,
     "RepoData": RepoData,
@@ -2474,6 +2513,7 @@ def doKickstartStorage(storage, ksdata, instClass):
     ksdata.volgroup.execute(storage, ksdata, instClass)
     ksdata.logvol.execute(storage, ksdata, instClass)
     ksdata.btrfs.execute(storage, ksdata, instClass)
+    ksdata.mount.execute(storage, ksdata, instClass)
     # setup snapshot here, that means add it to model and do the tests
     # snapshot will be created on the end of the installation
     ksdata.snapshot.setup(storage, ksdata, instClass)
