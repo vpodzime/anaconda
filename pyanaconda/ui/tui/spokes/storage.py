@@ -201,6 +201,13 @@ class StorageSpoke(NormalTUISpoke):
     def refresh(self, args=None):
         NormalTUISpoke.refresh(self, args)
 
+        if not any(d in self.storage.disks for d in self.disks):
+            # something happened to self.storage (probably reset), need to
+            # reinitialize the list of disks
+            threadMgr.add(AnacondaThread(name=THREAD_STORAGE_WATCHER,
+                                         target=self._initialize))
+
+
         # Join the initialization thread to block on it
         # This print is foul.  Need a better message display
         print(_(PAYLOAD_STATUS_PROBING_STORAGE))
@@ -367,7 +374,7 @@ class StorageSpoke(NormalTUISpoke):
         if self.autopart:
             self.clearPartType = CLEARPART_TYPE_ALL
         else:
-            self.clearPartType = CLEARPART_TYPE_NONE
+            self.clearPartType = None
 
         for disk in self.disks:
             if disk.name not in self.selected_disks and \
@@ -468,13 +475,18 @@ class PartTypeSpoke(NormalTUISpoke):
         self.title = N_("Partitioning Options")
         self._container = None
         self.parttypelist = sorted(PARTTYPES.keys())
-        self.clearPartType = None
+
+        # remember the original values so that we can detect a change
+        self._orig_clearpart_type = self.data.clearpart.type
+        self._orig_mount_assign = len(self.data.mount.dataList()) != 0
 
         # default to mount point assignment if it is already (partially)
         # configured
-        self._do_mount_assign = len(self.data.mount.dataList()) != 0
+        self._do_mount_assign = self._orig_mount_assign
         if not self._do_mount_assign:
             self.clearPartType = self.data.clearpart.type or CLEARPART_TYPE_ALL
+        else:
+            self.clearPartType = CLEARPART_TYPE_NONE
 
     @property
     def indirect(self):
@@ -485,7 +497,8 @@ class PartTypeSpoke(NormalTUISpoke):
         self._container = ListColumnContainer(1)
 
         for part_type in self.parttypelist:
-            c = CheckboxWidget(title=_(part_type), completed=(PARTTYPES[part_type] == self.clearPartType))
+            c = CheckboxWidget(title=_(part_type),
+                               completed=(not self._do_mount_assign and PARTTYPES[part_type] == self.clearPartType))
             self._container.add(c, self._select_partition_type_callback, part_type)
         c = CheckboxWidget(title=_("Manually assign mount points"), completed=self._do_mount_assign)
         self._container.add(c, self._select_mount_assign)
@@ -498,7 +511,7 @@ class PartTypeSpoke(NormalTUISpoke):
         self.window.add_with_separator(TextWidget(message))
 
     def _select_mount_assign(self, data=None):
-        self.clearPartType = None
+        self.clearPartType = CLEARPART_TYPE_NONE
         self._do_mount_assign = True
         self.apply()
 
@@ -513,19 +526,44 @@ class PartTypeSpoke(NormalTUISpoke):
         # True. In the case of ks installs which may not have defined any
         # partition options, autopart was never set to True, causing some
         # issues. (rhbz#1001061)
-        if not self._do_mount_assign and self.clearPartType is not None:
+        if not self._do_mount_assign:
             self.data.autopart.autopart = True
             self.data.clearpart.type = self.clearPartType
             self.data.clearpart.initAll = True
             self.data.mount.clear_mount_data()
         else:
             self.data.autopart.autopart = False
+            self.data.clearpart.type = CLEARPART_TYPE_NONE
+            self.data.clearpart.initAll = False
+
+    def _ensure_init_storage(self):
+        """
+        If a different clearpart type was chosen or mount point assignment was
+        chosen instead, we need to reset/rescan storage to revert all changes
+        done by the previous run of doKickstartStorage() and get everything into
+        the initial state.
+
+        """
+        # the only safe options are:
+        # 1) if nothing was set before (self._orig_clearpart_type is None) or
+        # 2) mount point assignment was done before and user just wants to tweak it
+        if self._orig_clearpart_type is not None or (self._orig_mount_assign and not self._do_mount_assign):
+            print(_("Reverting previous configuration. This may take a moment..."))
+            # unset self.data.ignoredisk.onlyuse temporarily so that
+            # storage_initialize() processes all devices
+            ignoredisk = self.data.ignoredisk.onlyuse
+            self.data.ignoredisk.onlyuse = []
+            storage_initialize(self.storage, self.data, self.storage.devicetree.protected_dev_names)
+            self.data.ignoredisk.onlyuse = ignoredisk
+            self.data.mount.clear_mount_data()
 
     def input(self, args, key):
         """Grab the choice and update things"""
         if not self._container.process_user_input(key):
             # TRANSLATORS: 'c' to continue
             if key.lower() == C_('TUI|Spoke Navigation', 'c'):
+                self.apply()
+                self._ensure_init_storage()
                 if self._do_mount_assign:
                     new_spoke = MountPointAssignSpoke(self.data, self.storage,
                                                       self.payload, self.instclass)
@@ -533,7 +571,6 @@ class PartTypeSpoke(NormalTUISpoke):
                     new_spoke = PartitionSchemeSpoke(self.data, self.storage,
                                                      self.payload, self.instclass)
                 ScreenHandler.push_screen_modal(new_spoke)
-                self.apply()
                 self.close()
                 return InputState.PROCESSED
             else:
@@ -616,10 +653,18 @@ class MountPointAssignSpoke(NormalTUISpoke):
 
         self._gather_mount_data_info()
 
+    def _is_dev_usable(self, dev):
+        maybe = not dev.protected and dev.size != Size(0)
+        if maybe and self.data.ignoredisk.onlyuse:
+            # all device's disks have to be in ignoredisk.onlyuse
+            maybe = set(self.data.ignoredisk.onlyuse).issuperset({d.name for d in dev.disks})
+
+        return maybe
+
     def _gather_mount_data_info(self):
         self._mds = OrderedDict()
 
-        for device in (d for d in self.storage.devicetree.leaves if not d.protected and d.size != Size(0)):
+        for device in filter(self._is_dev_usable, self.storage.devicetree.leaves):
             if device.format.type != "none":
                 fmt = device.format.type
             else:
@@ -694,8 +739,15 @@ class MountPointAssignSpoke(NormalTUISpoke):
                 question_window = YesNoDialog(text)
                 ScreenHandler.push_screen_modal(question_window)
                 if question_window.answer:
+                    # unset self.data.ignoredisk.onlyuse temporarily so that
+                    # storage_initialize() processes all devices
+                    ignoredisk = self.data.ignoredisk.onlyuse
+                    self.data.ignoredisk.onlyuse = []
+
                     print(_("Scanning disks. This may take a moment..."))
                     storage_initialize(self.storage, self.data, self.storage.devicetree.protected_dev_names)
+
+                    self.data.ignoredisk.onlyuse = ignoredisk
                     self.data.mount.clear_mount_data()
                     self._gather_mount_data_info()
                 self.redraw()
